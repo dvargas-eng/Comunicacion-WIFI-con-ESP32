@@ -1,0 +1,185 @@
+#include <WiFi.h>
+#include <ESPping.h>   // Instalar "ESPping" desde el Gestor de Bibliotecas
+
+// ----- Configuración de Serial -----
+static const uint32_t BAUD = 115200;
+
+// ----- Estados de entrada -----
+enum class InputState { WAIT_SELECTION, WAIT_PASSWORD, IDLE };
+InputState state = InputState::WAIT_SELECTION;
+
+// ----- Variables de selección/conexión -----
+int numRedes = 0;
+int selIndex = -1;
+String ssidSeleccionada = "";
+String passwordIngresada = "";
+
+// Utilidad: leer una línea completa del Serial (hasta '\n')
+String readLine() {
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  return s;
+}
+
+// Limpia el buffer serial para evitar “restos”
+void flushSerial() {
+  while (Serial.available()) { (void)Serial.read(); }
+}
+
+// Conexión a WiFi (maneja redes abiertas/cerradas)
+void conectarWiFi(const String& ssid, const String& pass, wifi_auth_mode_t auth) {
+  Serial.printf("Conectando a \"%s\" ...\n", ssid.c_str());
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  if (auth == WIFI_AUTH_OPEN || pass.length() == 0) {
+    WiFi.begin(ssid.c_str()); // red abierta
+  } else {
+    WiFi.begin(ssid.c_str(), pass.c_str()); // red con clave
+  }
+
+  uint8_t intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 40) { // ~20s
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ ¡Conectado!");
+    Serial.print("IP local: ");   Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");    Serial.println(WiFi.gatewayIP());
+    Serial.print("Submask: ");    Serial.println(WiFi.subnetMask());
+
+    // Iniciar escaneo de IPs activas
+    scanIPs();
+    state = InputState::IDLE;
+  } else {
+    Serial.println("❌ No se pudo conectar. Intente de nuevo.");
+    state = InputState::WAIT_SELECTION;
+  }
+}
+
+// Escaneo de IPs activas en la subred (ping 1 a 254)
+void scanIPs() {
+  IPAddress ip     = WiFi.localIP();
+  IPAddress mask   = WiFi.subnetMask();
+  IPAddress net;
+
+  // Calcular red: net = ip & mask
+  for (int i = 0; i < 4; i++) net[i] = ip[i] & mask[i];
+
+  Serial.println("\n🔎 Escaneando dispositivos activos (ping)...");
+  // Si la máscara no es /24, igual iteramos por conveniencia sólo el último octeto (común en redes domésticas)
+  for (int host = 1; host <= 254; host++) {
+    IPAddress testIp = net;
+    testIp[3] = host;
+
+    if (Ping.ping(testIp, 1)) {
+      Serial.print("💻 Dispositivo activo: ");
+      Serial.println(testIp);
+    }
+    delay(3); // pausa corta para no saturar
+  }
+  Serial.println("✅ Escaneo terminado.\n");
+}
+
+void setup() {
+  Serial.begin(BAUD);
+  Serial.setTimeout(100); // lectura de líneas ágil
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+
+  Serial.println("📡 Escaneando redes WiFi...");
+  numRedes = WiFi.scanNetworks();
+
+  if (numRedes <= 0) {
+    Serial.println("No se encontraron redes.");
+    return;
+  }
+
+  Serial.printf("Se encontraron %d redes:\n", numRedes);
+  for (int i = 0; i < numRedes; ++i) {
+    wifi_auth_mode_t auth = WiFi.encryptionType(i);
+    Serial.printf("%2d) %s  (RSSI: %d dBm)  %s  Canal:%d\n",
+                  i + 1,
+                  WiFi.SSID(i).c_str(),
+                  WiFi.RSSI(i),
+                  (auth == WIFI_AUTH_OPEN ? "Abierta" : "Segura"),
+                  WiFi.channel(i));
+  }
+
+  Serial.println("\n➡  Escriba el NÚMERO de la red y presione Enter.");
+  Serial.println("    (Opcional desde PC/Python: CONN:<SSID>,<PASSWORD>)");
+  state = InputState::WAIT_SELECTION;
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String line = readLine();
+  if (line.length() == 0) return;
+
+  // ----- Protocolo directo desde PC/Python -----
+  // Formato: CONN:<SSID>,<PASSWORD>
+  if (line.startsWith("CONN:")) {
+    String payload = line.substring(5);
+    int comma = payload.indexOf(',');
+    if (comma <= 0) {
+      Serial.println("Formato CONN inválido. Use: CONN:<SSID>,<PASSWORD>");
+      return;
+    }
+    String ssid = payload.substring(0, comma);
+    String pass = payload.substring(comma + 1);
+
+    // No sabemos el auth; intentamos como segura si trae password, o abierta si no
+    wifi_auth_mode_t auth = (pass.length() == 0) ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    conectarWiFi(ssid, pass, auth);
+    return;
+  }
+
+  // ----- Flujo interactivo por monitor serial -----
+  if (state == InputState::WAIT_SELECTION) {
+    // Intentar convertir la línea a número de índice
+    int idx = line.toInt(); // toInt() devuelve 0 si no es número
+    if (idx <= 0 || idx > numRedes) {
+      Serial.println("⚠ Número inválido. Intente de nuevo.");
+      Serial.println("Ingrese el NÚMERO de la red:");
+      return;
+    }
+
+    selIndex = idx - 1;
+    ssidSeleccionada = WiFi.SSID(selIndex);
+    wifi_auth_mode_t auth = WiFi.encryptionType(selIndex);
+
+    Serial.print("✅ Seleccionada: ");
+    Serial.println(ssidSeleccionada);
+
+    if (auth == WIFI_AUTH_OPEN) {
+      Serial.println("Red abierta (sin contraseña). Conectando...");
+      conectarWiFi(ssidSeleccionada, "", auth);
+      return;
+    } else {
+      Serial.println("Ingrese la CONTRASEÑA y presione Enter:");
+      state = InputState::WAIT_PASSWORD;
+      flushSerial();
+      return;
+    }
+  }
+  else if (state == InputState::WAIT_PASSWORD) {
+    passwordIngresada = line; // toda la línea es la contraseña (admite espacios)
+    wifi_auth_mode_t auth = WiFi.encryptionType(selIndex);
+    conectarWiFi(ssidSeleccionada, passwordIngresada, auth);
+    return;
+  }
+  else {
+    // IDLE: aceptar nuevos comandos si quieres re-escanear, etc.
+    if (line.equalsIgnoreCase("RESCAN")) {
+      Serial.println("Reinicie el dispositivo para re-escanear redes.");
+    }
+  }
+}
